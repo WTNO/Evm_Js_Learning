@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>菜鸟教程(runoob.com)</title>
+</head>
+
+<body>
+
+    <h1>JavaScript 字符串</h1>
+    <h2>中括号</h2>
+
+    <p>中括号 [] 返回字符串中对应索引位置的字符：</p>
+
+    <p id="demo"></p>
+    <p id="demo1"></p>
+    <p id="demo2"></p>
+    <p id="demo3"></p>
+
+    <script>
+        const name = "RUNOOB";
+        let letter = name[2];
+        document.getElementById("demo").innerHTML = letter;
+
+        var x = 'It\'s alright';
+        var y = "He is called \"Johnny\"";
+        document.getElementById("demo1").innerHTML = x + "<br>" + y;
+
+        var txt = "Hello World!";
+        document.write("<p>" + txt.length + "</p>");
+        var txt = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        document.write("<p>" + txt.length + "</p>");
+
+        // 不要创建 String 对象。它会拖慢执行速度，并可能产生其他副作用：
+        var x = "John";              // x是一个字符串
+        var y = new String("John");  // y是一个对象
+        document.getElementById("demo2").innerHTML = typeof x + " " + typeof y;
+
+        var x = "John";              // x 是字符串
+        var y = new String("John");  // y 是一个对象
+        document.getElementById("demo3").innerHTML = x === y;
+    </script>
+
+</body>
+
+</html>
