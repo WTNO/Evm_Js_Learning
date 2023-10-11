@@ -31,24 +31,168 @@ const (
 )
 ```
 
+可以使用表格来总结
 
+|opCodeRange|对应操作|
+|---|---|
+|0x0	|算术操作|
+|0x10	|比较操作|
+|0x20	|加密操作|
+|0x30	|状态闭包|
+|0x40	|区块操作|
+|0x50	|存储和执行操作|
+|0x60	|压栈操作|
+|0x80	|克隆操作|
+|0x90	|交换操作|
+|0xa0	|日志操作|
+|0xf0	|闭包|
 
+实现了判断能否压栈、操作码的byte类型和string类型互相转换的函数或接口。
 
+core/vm/opcodes.go
+```go
+func StringToOp(str string) OpCode  
+func (op OpCode) String() string  
+func (op OpCode) IsPush() bool
+```
 
+common/types.go
+```go
+AddressLength = 20
+HashLength = 32
+type Address [AddressLength]byte
+type bitvec [ ]byte
+// Hash represents the 32 byte Keccak256 hash of arbitrary data.
+type Hash [HashLength]byte
+```
 
+## contract.go
+### 合约的结构
+```go
+// Contract代表状态数据库中的以太坊合约。它包含
+// 合约代码，调用参数。Contract实现了ContractRef
+type Contract struct {
+	// CallerAddress是初始化这个
+	// 合约的调用者的结果。然而，当"call方法"被委托时，这个值
+	// 需要被初始化为调用者的调用者。
+	CallerAddress common.Address
+	caller        ContractRef
+	self          ContractRef
 
+	jumpdests map[common.Hash]bitvec // JUMPDEST分析的汇总结果。
+	analysis  bitvec                 // JUMPDEST分析的本地缓存结果
 
+	Code     []byte             // 代码字节数组
+	CodeHash common.Hash
+	CodeAddr *common.Address
+	Input    []byte
 
+	Gas   uint64
+	value *big.Int
+}
+```
 
+### 构造方法
+```go
+// NewContract 返回一个新的合约环境用于执行 EVM。
+func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract {
+	c := &Contract{CallerAddress: caller.Address(), caller: caller, self: object}
 
+	if parent, ok := caller.(*Contract); ok {
+		// 如果可用，从父上下文复用 JUMPDEST 分析。
+		c.jumpdests = parent.jumpdests
+	} else {
+		c.jumpdests = make(map[common.Hash]bitvec)
+	}
 
+	// Gas 应该是一个指针，这样它可以在运行中安全地减少
+	// 这个指针将会脱离状态转换
+	c.Gas = gas
+	// 确保设定一个值
+	c.value = value
 
+	return c
+}
+```
+该函数构造了新的合约，且如果是被合约调用，则复用该合约的 jumpdests
 
+### validJumpdest
+检验代码跳转是否合法
+```go
+func (c *Contract) validJumpdest(dest *uint256.Int) bool {
+    // 返回dest低64位，并返回一个布尔值，表示是否发生了溢出。
+	udest, overflow := dest.Uint64WithOverflow()
+	// 程序计数器不能超过代码的长度，当然也不能大于63位。
+	// 在这种情况下，不需要检查JUMPDEST。
+	if overflow || udest >= uint64(len(c.Code)) {
+		return false
+	}
+	// 只允许JUMPDEST作为目的地
+	if OpCode(c.Code[udest]) != JUMPDEST {
+		return false
+	}
+	return c.isCode(udest)
+}
+```
 
+```go
+// 如果提供的PC位置是一个实际的操作码，而不是PUSHN操作后的数据段，
+// 那么它会返回true。
+func (c *Contract) isCode(udest uint64) bool {
+	// 我们已经有一个分析了吗？
+	if c.analysis != nil {
+		return c.analysis.codeSegment(udest)
+	}
+	// 我们已经有一个合约哈希了吗？
+	// 如果我们有哈希，那就意味着它是一个'常规'合约。对于常规
+	// 合约（不是临时的initcode），我们在map中存储分析
+	if c.CodeHash != (common.Hash{}) {
+		// 父上下文是否有分析？
+		analysis, exist := c.jumpdests[c.CodeHash]
+		if !exist {
+			// 进行分析并保存在父上下文中
+			// 我们不需要将其存储在c.analysis中
+			analysis = codeBitmap(c.Code)
+			c.jumpdests[c.CodeHash] = analysis
+		}
+		// 也把它放在当前合约中以便更快地访问
+		c.analysis = analysis
+		return analysis.codeSegment(udest)
+	}
+	// 我们没有代码哈希，很可能是一段尚未在状态trie中的initcode。
+	// 在这种情况下，我们进行分析，并本地保存，这样
+	// 我们就不必为执行中的每一条JUMP指令重新计算
+	// 但是，我们不会把它保存在父上下文中
+	if c.analysis == nil {
+		c.analysis = codeBitmap(c.Code)
+	}
+	return c.analysis.codeSegment(udest)
+}
+```
 
+### AsDelegate
+`AsDelegate`将合约设置为委托调用并返回当前合同（用于链式调用）
+```go
+// AsDelegate 将合约设置为委托调用并返回当前合约（用于链式调用）
+func (c *Contract) AsDelegate() *Contract {
+	// 注意：调用者必须始终是一个合约。调用者不应该是除合约之外的其他东西。
+	parent := c.caller.(*Contract)
+	c.CallerAddress = parent.CallerAddress
+	c.value = parent.value
 
+	return c
+}
+```
 
-
+## stack.go
+为了应对高并发情况下的栈资源问题，代码中创建了 栈池 来保存一些被创造但未使用的栈空间。
+```go
+var stackPool = sync.Pool{
+	New: func() interface{} {
+		return &Stack{data: make([]uint256.Int, 0, 16)}
+	},
+}
+```
 
 
 
