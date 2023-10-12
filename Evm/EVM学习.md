@@ -254,6 +254,111 @@ type EVM struct {
 }
 ```
 
+#### 区块上下文
+前三个变量为函数类型，依次作用为 查询转账者账户是否有充足ether支持转账操作、转账操作、获取第n个区块的hash
+
+其余为一些基础的区块信息，如币基交易地址、Gaslimit、区块高、时间戳、难度值和基础费用
+
+区块一旦创建，区块信息不可以被修改
+```go
+// BlockContext为EVM提供辅助信息。一旦提供，就不应该修改。
+type BlockContext struct {
+	// CanTransfer返回账户是否包含足够的以太币进行转账
+	CanTransfer CanTransferFunc
+	// Transfer从一个账户转移以太币到另一个账户
+	Transfer TransferFunc
+	// GetHash返回对应于n的哈希
+	GetHash GetHashFunc
+
+	// 区块信息
+	Coinbase    common.Address // 提供COINBASE的信息
+	GasLimit    uint64         // 提供GASLIMIT的信息
+	BlockNumber *big.Int       // 提供NUMBER的信息
+	Time        uint64         // 提供TIME的信息
+	Difficulty  *big.Int       // 提供DIFFICULTY的信息
+	BaseFee     *big.Int       // 提供BASEFEE的信息
+	Random      *common.Hash   // 提供PREVRANDAO的信息
+}
+```
+
+#### 交易上下文
+```go
+// TxContext为EVM提供关于交易的信息。
+// 所有字段在交易之间都可能发生变化。
+type TxContext struct {
+	// 消息信息
+	Origin     common.Address // 提供ORIGIN的信息
+	GasPrice   *big.Int       // 提供GASPRICE的信息
+	BlobHashes []common.Hash  // 提供BLOBHASH的信息
+}
+```
+
+Origin是什么，就是第一个交易
+
+### evm方法
+#### 创建evm
+只能用一次
+```go
+// NewEVM 返回一个新的 EVM。返回的 EVM 不是线程安全的，应该
+// 只被使用*一次*。
+func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig *params.ChainConfig, config Config) *EVM {
+	evm := &EVM{
+		Context:     blockCtx,
+		TxContext:   txCtx,
+		StateDB:     statedb,
+		Config:      config,
+		chainConfig: chainConfig,
+		chainRules:  chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time),
+	}
+	evm.interpreter = NewEVMInterpreter(evm)
+	return evm
+}
+```
+
+#### Reset
+```go
+// Reset用新的交易上下文重置EVM。这不是线程安全的，应非常谨慎地执行。
+func (evm *EVM) Reset(txCtx TxContext, statedb StateDB) {
+	evm.TxContext = txCtx
+	evm.StateDB = statedb
+}
+```
+
+#### Cancel & Cancelled
+能够通过原子的修改abort使得取消任何evm操作
+```go
+// Cancel 取消任何正在运行的 EVM 操作。这个方法可以被并发调用，
+// 并且多次调用是安全的。
+func (evm *EVM) Cancel() {
+	evm.abort.Store(true)
+}
+
+// Cancelled 如果 Cancel 方法被调用过，那么返回 true
+func (evm *EVM) Cancelled() bool {
+	return evm.abort.Load()
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
