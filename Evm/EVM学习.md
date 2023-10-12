@@ -382,7 +382,8 @@ type EVMInterpreter struct {
 
 ### 方法
 #### 构造方法
-传入evm~~和配置信息构建新的解释器，根据配置信息设置该链的规则，如遵循eip158、eip150提议。~~
+传入evm和配置信息构建新的解释器，根据配置信息设置该链的规则，如遵循eip158、eip150提议。
+> `config` 包含在 `evm` 结构体中
 ```go
 // NewEVMInterpreter 返回 Interpreter 的一个新实例。
 func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
@@ -569,6 +570,116 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	return res, err
 }
 ```
+
+## jump_table.go
+### 数据结构
+```go
+type operation struct {
+	// execute 是操作函数
+	execute     executionFunc
+	constantGas uint64
+	dynamicGas  gasFunc
+	// minStack 告诉我们需要多少堆栈项
+	minStack int
+	// maxStack 指定了此操作所能拥有的堆栈的最大长度，
+	// 以防止堆栈溢出。
+	maxStack int
+
+	// memorySize 返回操作所需的内存大小
+	memorySize memorySizeFunc
+}
+```
+
+其中 `executionFunc` 有四处实现
+
+instructions.go
+```go
+func makeLog(size int) executionFunc
+func makePush(size uint64, pushByteSize int) executionFunc
+func makeDup(size int64) executionFunc
+func makeSwap(size int64) executionFunc
+```
+
+`memorySizeFunc` 的实现在memory_table.go文件中
+```go
+func memoryKeccak256(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(1))
+}
+
+func memoryCallDataCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(2))
+}
+
+func memoryReturnDataCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(2))
+}
+
+func memoryCodeCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(0), stack.Back(2))
+}
+
+func memoryExtCodeCopy(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(1), stack.Back(3))
+}
+
+func memoryMLoad(stack *Stack) (uint64, bool) {
+	return calcMemSize64WithUint(stack.Back(0), 32)
+}
+
+func memoryMStore8(stack *Stack) (uint64, bool) {
+	return calcMemSize64WithUint(stack.Back(0), 1)
+}
+
+func memoryMStore(stack *Stack) (uint64, bool) {
+	return calcMemSize64WithUint(stack.Back(0), 32)
+}
+
+func memoryCreate(stack *Stack) (uint64, bool) {
+	return calcMemSize64(stack.Back(1), stack.Back(2))
+}
+...
+```
+
+> Solidity的内存布局将前4个32字节的插槽保留
+> - 0x00 - 0x3f (64bytes): 暂存空间(Scratch space)
+> - 0x40 - 0x5f (32bytes): 空闲内存指针
+> - 0x60 - 0x7f (32bytes): 0 插槽值
+>
+> 他们的作用分别是
+> - 用来给hash方法和内联汇编使用
+> - 记录当前已经分配的内存大小，空闲内存的起始值为0x80
+> - 用作动态内存的初始值，不会被使用
+
+
+jumpTable包含指向操作的指针
+```go
+// JumpTable包含了在给定分叉处支持的EVM操作码。
+type JumpTable [256]*operation
+```
+
+检查jumpTable中的操作是否为空
+```go
+func validate(jt JumpTable) JumpTable {
+	for i, op := range jt {
+		if op == nil {
+			panic(fmt.Sprintf("op %#x is not set", i))
+		}
+		// 解释器做了一个假设，即如果设置了memorySize函数，
+		// 那么dynamicGas函数也会被设置。这是一个有些随意的假设，
+		// 如有需要，我们可以移除它 -- 但这样可以避免一个条件检查。
+		// 只要我们的假设存在，这个小的健壮性检查就可以防止我们合并违反这个假设的更改。
+		if op.memorySize != nil && op.dynamicGas == nil {
+			panic(fmt.Sprintf("op %v has dynamic memory but not dynamic gas", OpCode(i).String()))
+		}
+	}
+	return jt
+}
+```
+
+
+
+
+
 
 
 ### 合约预编译的作用
