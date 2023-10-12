@@ -339,14 +339,261 @@ func (evm *EVM) Cancelled() bool {
 }
 ```
 
+## interpreter.go
+### 数据结构
+#### Config
+解释器中会有一个配置结构体，能够选择debug模式，包含追踪操作码的evm日志，一些eip提议的配置，evm跳表
+```go
+// Config 是解释器的配置选项
+type Config struct {
+	Tracer                  EVMLogger // 操作码记录器
+	NoBaseFee               bool      // 强制将 EIP-1559 的基础费用设为 0 (对于价格为0的调用需要)
+	EnablePreimageRecording bool      // 启用 SHA3/keccak 预映像的记录
+	ExtraEips               []int     // 需要启用的额外 EIPS
+}
+```
+
+#### ScopeContext
+```go
+// ScopeContext 包含每次调用的内容，例如堆栈和内存，
+// 但不包含像 pc 和 gas 这样的瞬态变量
+type ScopeContext struct {
+	Memory   *Memory     // 内存
+	Stack    *Stack      // 堆栈
+	Contract *Contract   // 合约
+}
+```
+
+#### EVMInterpreter
+解释器结构，包含evm指针，hasher，是否只读，返回数据信息
+```go
+// EVMInterpreter 代表一个 EVM 解释器
+type EVMInterpreter struct {
+	evm   *EVM              // EVM 实例
+	table *JumpTable        // 跳转表
+
+	hasher    crypto.KeccakState // Keccak256 哈希实例，跨操作码共享
+	hasherBuf common.Hash        // Keccak256 哈希结果数组，跨操作码共享
+
+	readOnly   bool   // 是否在状态修改时抛出异常
+	returnData []byte // 上一次 CALL 的返回数据，供后续重用
+}
+```
+
+### 方法
+#### 构造方法
+传入evm~~和配置信息构建新的解释器，根据配置信息设置该链的规则，如遵循eip158、eip150提议。~~
+```go
+// NewEVMInterpreter 返回 Interpreter 的一个新实例。
+func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
+	// 如果跳转表没有初始化，我们设置一个默认的。
+	var table *JumpTable
+	switch {
+	case evm.chainRules.IsCancun:
+		table = &cancunInstructionSet
+	case evm.chainRules.IsShanghai:
+		table = &shanghaiInstructionSet
+	case evm.chainRules.IsMerge:
+		table = &mergeInstructionSet
+	case evm.chainRules.IsLondon:
+		table = &londonInstructionSet
+	case evm.chainRules.IsBerlin:
+		table = &berlinInstructionSet
+	case evm.chainRules.IsIstanbul:
+		table = &istanbulInstructionSet
+	case evm.chainRules.IsConstantinople:
+		table = &constantinopleInstructionSet
+	case evm.chainRules.IsByzantium:
+		table = &byzantiumInstructionSet
+	case evm.chainRules.IsEIP158:
+		table = &spuriousDragonInstructionSet
+	case evm.chainRules.IsEIP150:
+		table = &tangerineWhistleInstructionSet
+	case evm.chainRules.IsHomestead:
+		table = &homesteadInstructionSet
+	default:
+		table = &frontierInstructionSet
+	}
+	var extraEips []int
+	if len(evm.Config.ExtraEips) > 0 {
+		// 对跳转表进行深拷贝以防止在其他表中修改操作码
+		table = copyJumpTable(table)
+	}
+	for _, eip := range evm.Config.ExtraEips {
+		if err := EnableEIP(eip, table); err != nil {
+			// 禁用它，这样调用者可以检查它是否被激活
+			log.Error("EIP激活失败", "eip", eip, "错误", err)
+		} else {
+			extraEips = append(extraEips, eip)
+		}
+	}
+	evm.Config.ExtraEips = extraEips
+	return &EVMInterpreter{evm: evm, table: table}
+}
+```
+
+#### Run
+```go
+// 运行循环并使用给定的输入数据评估合约的代码，返回
+// 返回的字节切片和一个错误（如果有的话）。
+//
+// 重要的是注意，解释器返回的任何错误都应该被
+// 视为撤销并消耗所有燃气的操作，除非是
+// ErrExecutionReverted表示撤销并保留剩余的燃气。
+func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	// 增加调用深度，限制为1024
+	in.evm.depth++
+	defer func() { in.evm.depth-- }()
+
+	// 确保只有在我们还没有处于只读状态时才设置只读。
+	// 这也确保了子调用不会删除只读标志。
+	if readOnly && !in.readOnly {
+		in.readOnly = true
+		defer func() { in.readOnly = false }()
+	}
+
+	// 重置上一个调用的返回数据。保留旧缓冲区并不重要
+	// 因为每个返回调用都会返回新的数据。
+	in.returnData = nil
+
+	// 如果没有代码，就不要执行。
+	if len(contract.Code) == 0 {
+		return nil, nil
+	}
+
+	var (
+		op          OpCode        // 当前操作码
+		mem         = NewMemory() // 绑定内存
+		stack       = newstack()  // 本地栈
+		callContext = &ScopeContext{
+			Memory:   mem,
+			Stack:    stack,
+			Contract: contract,
+		}
+		// 出于优化的原因，我们使用uint64作为程序计数器。
+		// 理论上可以超过2^64。YP将PC定义为uint256。实际上，这是不可能的。
+		pc   = uint64(0) // 程序计数器
+		cost uint64
+		// 跟踪器使用的副本
+		pcCopy  uint64 // 需要延迟的EVMLogger
+		gasCopy uint64 // 为EVMLogger记录执行前剩余的燃气
+		logged  bool   // 延迟的EVMLogger应忽略已经记录的步骤
+		res     []byte // 操作码执行函数的结果
+		debug   = in.evm.Config.Tracer != nil
+	)
+	// 不要移动这个延迟函数，它放在capturestate-deferred方法之前，
+	// 所以它在执行之后：capturestate需要在返回到池之前的栈
+	defer func() {
+		returnStack(stack)
+	}()
+	contract.Input = input
+
+	if debug {
+		defer func() {
+			if err != nil {
+				if !logged {
+					in.evm.Config.Tracer.CaptureState(pcCopy, op, gasCopy, cost, callContext, in.returnData, in.evm.depth, err)
+				} else {
+					in.evm.Config.Tracer.CaptureFault(pcCopy, op, gasCopy, cost, callContext, in.evm.depth, err)
+				}
+			}
+		}()
+	}
+	// 解释器主运行循环（上下文）。这个循环运行直到显式的STOP, RETURN或SELFDESTRUCT被执行，
+	// 在执行操作过程中出现错误，或者父上下文设置了done标志。
+	for {
+		if debug {
+			// 捕获执行前的值以进行跟踪。
+			logged, pcCopy, gasCopy = false, pc, contract.Gas
+		}
+		// 从跳转表中获取操作，并验证栈以确保有足够的栈项可用来执行操作。
+		op = contract.GetOp(pc)
+		operation := in.table[op]
+		cost = operation.constantGas // 用于跟踪
+		// 验证栈
+		if sLen := stack.len(); sLen < operation.minStack {
+			return nil, &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
+		} else if sLen > operation.maxStack {
+			return nil, &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
+		}
+		if !contract.UseGas(cost) {
+			return nil, ErrOutOfGas
+		}
+		if operation.dynamicGas != nil {
+			// 所有具有动态内存使用的操作也具有动态燃气成本。
+			var memorySize uint64
+			// 计算新的内存大小并扩展内存以适应操作
+			// 内存检查需要在评估动态燃气部分之前完成，以检测计算溢出
+			if operation.memorySize != nil {
+				memSize, overflow := operation.memorySize(stack)
+				if overflow {
+					return nil, ErrGasUintOverflow
+				}
+				// 内存以32字节的字扩展。燃气也以字计算。
+				if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+					return nil, ErrGasUintOverflow
+				}
+			}
+			// 消耗燃气并在没有足够的燃气可用时返回错误。
+			// cost被显式设置，以便capture state 延迟方法可以得到适当的成本
+			var dynamicCost uint64
+			dynamicCost, err = operation.dynamicGas(in.evm, contract, stack, mem, memorySize)
+			cost += dynamicCost // 用于跟踪
+			if err != nil || !contract.UseGas(dynamicCost) {
+				return nil, ErrOutOfGas
+			}
+			// 在内存扩展之前进行跟踪
+			if debug {
+				in.evm.Config.Tracer.CaptureState(pc, op, gasCopy, cost, callContext, in.returnData, in.evm.depth, err)
+				logged = true
+			}
+			if memorySize > 0 {
+				mem.Resize(memorySize)
+			}
+		} else if debug {
+			in.evm.Config.Tracer.CaptureState(pc, op, gasCopy, cost, callContext, in.returnData, in.evm.depth, err)
+			logged = true
+		}
+		// 执行操作
+		res, err = operation.execute(&pc, in, callContext)
+		if err != nil {
+			break
+		}
+		pc++
+	}
+
+	if err == errStopToken {
+		err = nil // 清除停止标记错误
+	}
+
+	return res, err
+}
+```
 
 
+### 合约预编译的作用
+预编译合约是 EVM 中用于提供更复杂库函数(通常用于加密、散列等复杂操作)的一种折衷方法，这些函数不适合编写操作码。 它们适用于简单但经常调用的合约，或逻辑上固定但计算量很大的合约。 预编译合约是在使用节点客户端代码实现的，因为它们不需要 EVM，所以运行速度很快。 与使用直接在 EVM 中运行的函数相比，它对开发人员来说成本也更低。
 
 
+### evm调用contract的步骤
+- 判断调用深度是否大于1024
+- 判断是否有充足的余额支持调用
+- 进行快照和预编译
+- 检查该地址是否在状态数据库中存在
+- 若不存在，调用一个不存在的帐户，不要做任何事情，只需ping跟踪程序，检查是否是debug模式，若不是则会创建账户
+- 判断是否预编译，若是调用节点客户端代码实现；反之，创建合约对象并加载被调用地址和地址的hash以及代码信息，后用解释器来运行
+- 若运行过程中有任何错误，则状态将会回滚到操作前快照处，并消耗gas
 
+> evm调用深度 <= 1024
 
+### 以太坊中的调用call、callcode和delegatecall
+|调用方式	|修改的storage	|调用者的msg.sender	|被调用者的msg.sender	|执行的上下文|
+|---|---|---|---|---|
+|call	|被调用者的storage	|交易发起者的地址	|调用者的地址	|被调用者|
+|callcode	|调用者的storage	|调用者的地址	|调用者的地址	|调用者|
+|delegatecall	|调用者的storage	|交易发起者的地址	|调用者的地址	|调用者|
 
-
+还有staticCall调用过程中不允许进行任何修改操作，可以用view来修饰，因此在函数实现中会给解释器的运行函数中的read-only参数传入true值。
 
 
 
