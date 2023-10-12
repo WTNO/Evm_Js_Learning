@@ -194,15 +194,65 @@ var stackPool = sync.Pool{
 }
 ```
 
+## memory.go
+### 数据结构
+```go
+// Memory 为以太坊虚拟机实现了一个简单的内存模型。
+type Memory struct {
+	store       []byte // 存储
+	lastGasCost uint64 // 上一次的燃气费用
+}
+```
 
+为以太坊虚拟机提供一个简单存储的模型
+```go
+func (m *Memory) Set(offset, size uint64, value []byte) 
+func (m *Memory) Set32(offset uint64, val *uint256.Int) 
+func (m *Memory) Resize(size uint64)
+func (m *Memory) GetCopy(offset, size int64) (cpy []byte)  // 截取切片中的一段 (offset,offset+size)
+func (m *Memory) GetPtr(offset, size int64)  // 返回切片中的一段的指针
+func (m *Memory) Len() int
+func (m *Memory) Data() []byte
+```
 
+## memory_table.go
+衡量一些操作所消耗的内存大小同时判断是否会发生栈溢出，如keccak256、callDataCopy、MStore等
 
+## EVM.go
+### EVM结构
+evm是以太坊虚拟机基础对象，提供工具处理对应上下文中的交易。运行过程中一旦发生错误，状态会回滚并且不退还gas费用，运行中产生的任务错误都会被归结为代码错误。
+```go
+// EVM是以太坊虚拟机的基础对象，提供了在给定状态下运行合约所需的工具，
+// 并提供了相应的上下文。需要注意的是，任何通过调用生成的错误都应被视为
+// 一种回滚状态并消耗所有气体的操作，不应进行任何特定错误的检查。
+// 解释器确保任何生成的错误都被视为错误的代码。
+//
+// EVM永远不应被重用，且不是线程安全的。
+type EVM struct {
+	// Context提供辅助的区块链相关信息
+	Context BlockContext
+	TxContext
+	// StateDB提供访问底层状态的权限
+	StateDB StateDB
+	// Depth是当前的调用堆栈
+	depth int
 
-
-
-
-
-
+	// chainConfig包含了当前链的信息
+	chainConfig *params.ChainConfig
+	// chain rules包含了当前时代的链规则
+	chainRules params.Rules
+	// 用于初始化evm的虚拟机配置选项
+	Config Config
+	// 全局的（在此上下文中）以太坊虚拟机
+	// 在整个交易执行过程中使用。
+	interpreter *EVMInterpreter
+	// abort用于中止EVM调用操作
+	abort atomic.Bool
+	// callGasTemp保存当前调用可用的gas。这是必要的，因为
+	// 可用的gas是按照63/64规则在gasCall*中计算的，然后在opCall*中应用。
+	callGasTemp uint64
+}
+```
 
 
 
