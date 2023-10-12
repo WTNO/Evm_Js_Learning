@@ -676,11 +676,150 @@ func validate(jt JumpTable) JumpTable {
 }
 ```
 
+### 源码
+我们知道 `opCode`是代码的解释器，这里的`operation`就是`opCode`的解释器，`interpreter`中有一个`jumptable`，它包含了指向操作的指针，`jumptable`中的操作就是对应`opCode`的操作，但是在不同的`config`配置下，操作集合也会遵循不同的规则。
 
+例如我们可以看看部分代码
+```go
+// newFrontierInstructionSet返回可以在前沿阶段执行的前沿指令
+// newFrontierInstructionSet返回的是可以在frontier阶段执行的指令集。
+func newFrontierInstructionSet() JumpTable {
+	tbl := JumpTable{
+		STOP: {
+			execute:     opStop, // 执行停止操作
+			constantGas: 0,
+			minStack:    minStack(0, 0),
+			maxStack:    maxStack(0, 0),
+		},
+		ADD: {
+			execute:     opAdd, // 执行增加操作
+			constantGas: GasFastestStep,
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+		MUL: {
+			execute:     opMul, // 执行乘法操作
+			constantGas: GasFastStep, 
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+		SUB: {
+			execute:     opSub, // 执行减法操作
+			constantGas: GasFastestStep, 
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+		DIV: {
+			execute:     opDiv, // 执行除法操作
+			constantGas: GasFastStep, 
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+		SDIV: {
+			execute:     opSdiv, // 执行符号除法操作
+			constantGas: GasFastStep, 
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+		MOD: {
+			execute:     opMod, // 执行模运算操作
+			constantGas: GasFastStep, 
+			minStack:    minStack(2, 1), 
+			maxStack:    maxStack(2, 1), 
+		},
+        SELFDESTRUCT: {
+			execute:    opSelfdestruct, // 执行自毁操作
+			dynamicGas: gasSelfdestruct,
+			minStack:   minStack(1, 0),
+			maxStack:   maxStack(1, 0),
+		},
+	}
 
+	// 用opUndefined填充所有未分配的插槽。
+	// 对于表中的所有未定义的操作，都将其定义为opUndefined。
+	for i, entry := range tbl {
+		if entry == nil {
+			tbl[i] = &operation{execute: opUndefined, maxStack: maxStack(0, 0)}
+		}
+	}
 
+	return validate(tbl) // 验证表
+}
+```
 
+## instructions.go
+指令集合，封装了操作指定过程中的堆栈操作。
 
+## gas.go
+根据是否遵循EIP150，返回实际的调用产生的费用
+```go
+// Gas costs
+const (
+	GasQuickStep   uint64 = 2
+	GasFastestStep uint64 = 3
+	GasFastStep    uint64 = 5
+	GasMidStep     uint64 = 8
+	GasSlowStep    uint64 = 10
+	GasExtStep     uint64 = 20
+)
+
+// callGas返回调用的实际气体成本。
+//
+// 在家园价格变更HF期间，气体成本发生了变化。
+// 作为EIP 150（TangerineWhistle）的一部分，返回的气体是气体 - 基础 * 63 / 64。
+func callGas(isEip150 bool, availableGas, base uint64, callCost *uint256.Int) (uint64, error) {
+	if isEip150 {
+		availableGas = availableGas - base
+		gas := availableGas - availableGas/64
+		// 如果比特长度超过64位，我们知道新计算的EIP150的"气体"
+		// 小于请求的数量。因此，我们返回新的气体，而不是
+		// 返回错误。
+		if !callCost.IsUint64() || gas < callCost.Uint64() {
+			return gas, nil
+		}
+	}
+	if !callCost.IsUint64() {
+		return 0, ErrGasUintOverflow
+	}
+
+	return callCost.Uint64(), nil
+}
+```
+
+## gas_table.go
+一些操作的gas值计算，如自毁、Call、Callcode、delegateCall、staticCall、内存存储等，如：
+```go
+// memoryGasCost 计算内存扩展的二次气体。它只对
+// 扩展的内存区域进行计算，而不是总内存。
+func memoryGasCost(mem *Memory, newMemSize uint64) (uint64, error) {
+	if newMemSize == 0 {
+		return 0, nil
+	}
+	// 最大的可以放入 uint64 的是 max_word_count - 1。任何超过
+	// 这个将导致溢出。另外，如果新的内存大小导致
+	// newMemSizeWords 大于 0xFFFFFFFF 将会导致平方操作
+	// 溢出。常数 0x1FFFFFFFE0 是可以使用的最大数字，
+	// 不会导致气体计算溢出。
+	if newMemSize > 0x1FFFFFFFE0 {
+		return 0, ErrGasUintOverflow
+	}
+	newMemSizeWords := toWordSize(newMemSize)
+	newMemSize = newMemSizeWords * 32
+
+	if newMemSize > uint64(mem.Len()) {
+		square := newMemSizeWords * newMemSizeWords
+		linCoef := newMemSizeWords * params.MemoryGas
+		quadCoef := square / params.QuadCoeffDiv
+		newTotalFee := linCoef + quadCoef
+
+		fee := newTotalFee - mem.lastGasCost
+		mem.lastGasCost = newTotalFee
+
+		return fee, nil
+	}
+	return 0, nil
+}
+```
 
 ### 合约预编译的作用
 预编译合约是 EVM 中用于提供更复杂库函数(通常用于加密、散列等复杂操作)的一种折衷方法，这些函数不适合编写操作码。 它们适用于简单但经常调用的合约，或逻辑上固定但计算量很大的合约。 预编译合约是在使用节点客户端代码实现的，因为它们不需要 EVM，所以运行速度很快。 与使用直接在 EVM 中运行的函数相比，它对开发人员来说成本也更低。
