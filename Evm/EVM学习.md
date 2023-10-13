@@ -432,6 +432,123 @@ func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, err
 }
 ```
 
+创建 `stateTransition` 对象，执行 `TransitionDb()` 方法：
+```go
+// TransitionDb将通过应用当前消息来改变状态，并返回以下字段的EVM执行结果。
+//
+//   - 已使用的gas：总共使用的gas（包括正在退款的gas）
+//   - 返回数据：来自EVM的返回数据
+//   - 具体执行错误：中断执行的各种EVM错误，例如
+//     ErrOutOfGas，ErrExecutionReverted
+//
+// 但是，如果遇到任何共识问题，则直接返回错误，并返回
+// nil EVM执行结果。
+func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
+	// 首先检查此消息是否在应用消息之前满足所有共识规则。规则包括以下条款：
+	//
+	// 1. 消息调用者的nonce是正确的
+	// 2. 调用者有足够的余额来支付交易费用（gaslimit * gasprice）
+	// 3. 所需的gas量在块中是可用的
+	// 4. 购买的gas足以覆盖内在使用
+	// 5. 计算内在gas时没有溢出
+	// 6. 调用者有足够的余额来覆盖**最顶层**调用的资产转移
+
+	// 检查条款1-3，如果一切正确，则购买gas
+	if err := st.preCheck(); err != nil {
+		return nil, err
+	}
+
+	if tracer := st.evm.Config.Tracer; tracer != nil {
+		tracer.CaptureTxStart(st.initialGas)
+		defer func() {
+			tracer.CaptureTxEnd(st.gasRemaining)
+		}()
+	}
+
+	var (
+		msg              = st.msg
+		sender           = vm.AccountRef(msg.From)
+		rules            = st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber, st.evm.Context.Random != nil, st.evm.Context.Time)
+		contractCreation = msg.To == nil
+	)
+
+	// 检查条款4-5，如果一切正确，则减去内在gas
+	gas, err := IntrinsicGas(msg.Data, msg.AccessList, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
+	if err != nil {
+		return nil, err
+	}
+	if st.gasRemaining < gas {
+		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, gas)
+	}
+	st.gasRemaining -= gas
+
+	// 检查条款6
+	if msg.Value.Sign() > 0 && !st.evm.Context.CanTransfer(st.state, msg.From, msg.Value) {
+		return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From.Hex())
+	}
+
+	// 检查初始化代码大小是否已超过。
+	if rules.IsShanghai && contractCreation && len(msg.Data) > params.MaxInitCodeSize {
+		return nil, fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, len(msg.Data), params.MaxInitCodeSize)
+	}
+
+	// 执行状态转换的准备步骤，包括：
+	// - 准备访问列表（post-berlin）
+	// - 重置临时存储（eip 1153）
+	st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
+
+	var (
+		ret   []byte
+		vmerr error // vm错误不影响共识，因此不分配给err
+	)
+	if contractCreation {
+		ret, _, st.gasRemaining, vmerr = st.evm.Create(sender, msg.Data, st.gasRemaining, msg.Value)
+	} else {
+		// 为下一次交易增加nonce
+		st.state.SetNonce(msg.From, st.state.GetNonce(sender.Address())+1)
+		ret, st.gasRemaining, vmerr = st.evm.Call(sender, st.to(), msg.Data, st.gasRemaining, msg.Value)
+	}
+
+	if !rules.IsLondon {
+		// 在EIP-3529之前：退款被限制为gasUsed / 2
+		st.refundGas(params.RefundQuotient)
+	} else {
+		// 在EIP-3529之后：退款被限制为gasUsed / 5
+		st.refundGas(params.RefundQuotientEIP3529)
+	}
+	effectiveTip := msg.GasPrice
+	if rules.IsLondon {
+		effectiveTip = cmath.BigMin(msg.GasTipCap, new(big.Int).Sub(msg.GasFeeCap, st.evm.Context.BaseFee))
+	}
+
+	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
+		// 当NoBaseFee设置为0且费用字段为0时，跳过费用支付。
+		// 这避免了在模拟调用时将负的effectiveTip应用到coinbase。
+	} else {
+		fee := new(big.Int).SetUint64(st.gasUsed())
+		fee.Mul(fee, effectiveTip)
+		st.state.AddBalance(st.evm.Context.Coinbase, fee)
+	}
+
+	return &ExecutionResult{
+		UsedGas:    st.gasUsed(),
+		Err:        vmerr,
+		ReturnData: ret,
+	}, nil
+}
+```
+
+3.1 调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
+
+3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message
+
+
+
+
+
+
+
+
 
 ## interpreter.go
 ### 数据结构
