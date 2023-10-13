@@ -339,6 +339,100 @@ func (evm *EVM) Cancelled() bool {
 }
 ```
 
+### 执行交易过程
+同步一个新的区块准备插入本地BlockChain之前需要重放并执行新区块的所有交易，并产生交易收据和日志。以太坊是如何执行这些交易呢？这就要请出大名鼎鼎的以太坊虚拟机。
+
+以太坊虚拟机在执行交易分为两个部分
+1. 第一部分是创建EVM，计算交易金额，设置交易对象，计算交易gas花销；
+2. 第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。
+
+#### 创建EVM，通过EVM执行交易流程
+BlockChain调用processor.Process（）遍历block的所有交易，然后调用：
+```go
+receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)
+```
+
+执行交易并返回收据数据
+```go
+// ApplyTransaction尝试将交易应用到给定的状态数据库
+// 并使用输入参数作为其环境。它返回交易的收据，
+// 已使用的gas和如果交易失败的错误，
+// 表明区块是无效的。
+func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, error) {
+	msg, err := TransactionToMessage(tx, types.MakeSigner(config, header.Number, header.Time), header.BaseFee)
+	if err != nil {
+		return nil, err
+	}
+	// 创建一个新的上下文以在EVM环境中使用
+	blockContext := NewEVMBlockContext(header, bc, author)
+	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)
+	return applyTransaction(msg, config, gp, statedb, header.Number, header.Hash(), tx, usedGas, vmenv)
+}
+
+func applyTransaction(msg *Message, config *params.ChainConfig, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, usedGas *uint64, evm *vm.EVM) (*types.Receipt, error) {
+	// 在EVM环境中创建一个新的上下文
+	txContext := NewEVMTxContext(msg)
+	evm.Reset(txContext, statedb)
+
+	// 将交易应用到当前状态（包含在环境中）
+	result, err := ApplyMessage(evm, msg, gp)
+	if err != nil {
+		return nil, err
+	}
+
+	// 使用待处理的更改更新状态
+	var root []byte
+	if config.IsByzantium(blockNumber) {
+		statedb.Finalise(true)
+	} else {
+		root = statedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
+	}
+	*usedGas += result.UsedGas
+
+	// 为交易创建一个新的收据，存储中间状态根和交易使用的gas
+	receipt := &types.Receipt{Type: tx.Type(), PostState: root, CumulativeGasUsed: *usedGas}
+	if result.Failed() {
+		receipt.Status = types.ReceiptStatusFailed
+	} else {
+		receipt.Status = types.ReceiptStatusSuccessful
+	}
+	receipt.TxHash = tx.Hash()
+	receipt.GasUsed = result.UsedGas
+
+	// 如果交易创建了一个合约，将创建地址存储在收据中
+	if msg.To == nil {
+		receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
+	}
+
+	// 设置收据日志并创建bloom过滤器
+	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash)
+	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+	receipt.BlockHash = blockHash
+	receipt.BlockNumber = blockNumber
+	receipt.TransactionIndex = uint(statedb.TxIndex())
+	return receipt, err
+}
+```
+
+1. 首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。
+2. 调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。
+3. 调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。
+
+重点看看ApplyMessage()方法的实现：
+```go
+// ApplyMessage 通过在环境中应用给定的消息来计算新的状态
+// 对旧的状态进行操作。
+//
+// ApplyMessage 返回任何EVM执行（如果发生）返回的字节，
+// 使用的气体（包括气体退款）和一个错误，如果它失败了。错误始终
+// 表示一个核心错误，这意味着该消息对于那个特定
+// 的状态总是会失败，永远不会被接受在一个块内。
+func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
+	return NewStateTransition(evm, msg, gp).TransitionDb()
+}
+```
+
+
 ## interpreter.go
 ### 数据结构
 #### Config
