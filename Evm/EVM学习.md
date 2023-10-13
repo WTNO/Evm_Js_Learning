@@ -587,7 +587,12 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	> gasCost表示执行这个指令需要消耗的gas  
 	> validateStack计算是不是解析器栈溢出  
 	> memorySize用于计算operation的占用内存大小  
-3.
+3. 如果operation可用，解析器栈不超过1024，且读写不冲突
+4. 计算operation的memorysize，不能大于64位。
+5. 根据不同的指令，指令的memorysize等，调用operation.gasCost()方法计算执行operation指令需要消耗的gas。
+6. 调用operation.execute(&pc, in.evm, contract, mem, stack)执行指令对应的方法。
+7. operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。
+8. operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。
 
 
 ## jump_table.go
