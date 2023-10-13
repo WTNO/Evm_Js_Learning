@@ -540,10 +540,136 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 
 3.1 调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
 
-3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message
+3.2 如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message
+```go
+// Create使用代码作为部署代码创建新的合约。
+func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+	contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
+	return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
+}
 
+// Create2使用代码作为部署代码创建新的合约。
+//
+// Create2与Create的不同之处在于，Create2使用keccak256(0xff ++ msg.sender ++ salt ++ keccak256(init_code))[12:]
+// 而不是通常的发送者和随机数哈希作为初始化合约的地址。
+func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *big.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+	codeAndHash := &codeAndHash{code: code}
+	contractAddr = crypto.CreateAddress2(caller.Address(), salt.Bytes32(), codeAndHash.Hash().Bytes())
+	return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2)
+}
 
+// create函数使用代码作为部署代码创建新的合约。
+func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64, value *big.Int, address common.Address, typ OpCode) ([]byte, common.Address, uint64, error) {
+	// 执行深度检查。如果我们试图执行超过限制的代码，则失败。
+	if evm.depth > int(params.CallCreateDepth) {
+		return nil, common.Address{}, gas, ErrDepth
+	}
+	if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		return nil, common.Address{}, gas, ErrInsufficientBalance
+	}
+	// 获取nonce值
+	nonce := evm.StateDB.GetNonce(caller.Address())
+	// 检查nonce是否溢出
+	if nonce+1 < nonce {
+		return nil, common.Address{}, gas, ErrNonceUintOverflow
+	}
+	// 设置新的nonce值
+	evm.StateDB.SetNonce(caller.Address(), nonce+1)
+	// 在获取快照之前将地址添加到访问列表中。即使创建失败，访问列表的改变也不应该被回滚
+	if evm.chainRules.IsBerlin {
+		evm.StateDB.AddAddressToAccessList(address)
+	}
+	// 确保指定的地址没有现有的合约
+	contractHash := evm.StateDB.GetCodeHash(address)
+	if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != emptyCodeHash) {
+		return nil, common.Address{}, 0, ErrContractAddressCollision
+	}
+	// 在状态中创建新账户
+	snapshot := evm.StateDB.Snapshot()
+	evm.StateDB.CreateAccount(address)
+	if evm.chainRules.IsEIP158 {
+		evm.StateDB.SetNonce(address, 1)
+	}
+	// 从调用者账户转账到新账户
+	evm.Context.Transfer(evm.StateDB, caller.Address(), address, value)
 
+	// 初始化一个新的合约并设置EVM要使用的代码。
+	// 合约是此执行环境的范围环境。
+	contract := NewContract(caller, AccountRef(address), value, gas)
+	contract.SetCodeOptionalHash(&address, codeAndHash)
+
+	// 如果存在追踪器，捕获开始和进入事件
+	if evm.Config.Tracer != nil {
+		if evm.depth == 0 {
+			evm.Config.Tracer.CaptureStart(evm, caller.Address(), address, true, codeAndHash.code, gas, value)
+		} else {
+			evm.Config.Tracer.CaptureEnter(typ, caller.Address(), address, codeAndHash.code, gas, value)
+		}
+	}
+
+	// 运行合约并获取结果
+	ret, err := evm.interpreter.Run(contract, nil, false)
+
+	// 检查是否超过了最大代码大小，如果是则赋值错误
+	if err == nil && evm.chainRules.IsEIP158 && len(ret) > params.MaxCodeSize {
+		err = ErrMaxCodeSizeExceeded
+	}
+
+	// 如果EIP-3541启用，拒绝以0xEF开头的代码。
+	if err == nil && len(ret) >= 1 && ret[0] == 0xEF && evm.chainRules.IsLondon {
+		err = ErrInvalidCode
+	}
+
+	// 如果合约创建成功运行且没有返回错误
+	// 计算存储代码所需的gas。如果代码不能
+	// 由于gas不足而存储，设置一个错误并让它被
+	// 下面的错误检查条件处理。
+	if err == nil {
+		createDataGas := uint64(len(ret)) * params.CreateDataGas
+		if contract.UseGas(createDataGas) {
+			evm.StateDB.SetCode(address, ret)
+		} else {
+			err = ErrCodeStoreOutOfGas
+		}
+	}
+
+	// 当EVM返回错误，或者当设置创建代码
+	// 上面我们回滚到快照并消耗任何剩余的gas。此外
+	// 当我们在homestead这也计算代码存储gas错误。
+	if err != nil && (evm.chainRules.IsHomestead || err != ErrCodeStoreOutOfGas) {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		if err != ErrExecutionReverted {
+			contract.UseGas(contract.Gas)
+		}
+	}
+
+	// 如果存在追踪器，捕获结束和退出事件
+	if evm.Config.Tracer != nil {
+		if evm.depth == 0 {
+			evm.Config.Tracer.CaptureEnd(ret, gas-contract.Gas, err)
+		} else {
+			evm.Config.Tracer.CaptureExit(ret, gas-contract.Gas, err)
+		}
+	}
+	return ret, address, contract.Gas, err
+}
+```
+
+3.2.1 evm执行栈深度不能超过1024，发送方持有的以太坊数量大于此次合约交易金额。
+
+3.2.2 对该发送方地址的nonce值+1，通过地址和nonce值生成合约地址，通过合约地址得到合约hash值。
+
+3.2.3 记录一个状态快照，用来后见失败回滚。
+
+3.2.4 为这个合约地址创建一个合约账户，并为这个合约账户设置nonce值为1
+
+3.2.5 产生以太坊资产转移，发送方地址账户金额减value值，合约账户的金额加value值。
+
+3.2.6 根据发送方地址和合约地址，以及金额value 值和gas，合约代码和代码hash值，创建一个合约对象
+
+3.2.7 run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。
+
+3.2.8 如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。
 
 
 
