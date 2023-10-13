@@ -571,6 +571,25 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 }
 ```
 
+我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。
+1. 首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。
+2. 从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是
+	```go
+	SHA3: {
+		execute:       opSha3,
+		gasCost:       gasSha3,
+		validateStack: makeStackFunc(2, 1),
+		memorySize:    memorySha3,
+		valid:         true,
+	}
+	```
+	> execute表示指令对应的执行方法  
+	> gasCost表示执行这个指令需要消耗的gas  
+	> validateStack计算是不是解析器栈溢出  
+	> memorySize用于计算operation的占用内存大小  
+3.
+
+
 ## jump_table.go
 ### 数据结构
 ```go
@@ -821,6 +840,9 @@ func memoryGasCost(mem *Memory, newMemSize uint64) (uint64, error) {
 }
 ```
 
+## contracts.go
+存放预编译好的合约
+
 ### 合约预编译的作用
 预编译合约是 EVM 中用于提供更复杂库函数(通常用于加密、散列等复杂操作)的一种折衷方法，这些函数不适合编写操作码。 它们适用于简单但经常调用的合约，或逻辑上固定但计算量很大的合约。 预编译合约是在使用节点客户端代码实现的，因为它们不需要 EVM，所以运行速度很快。 与使用直接在 EVM 中运行的函数相比，它对开发人员来说成本也更低。
 
@@ -845,12 +867,22 @@ func memoryGasCost(mem *Memory, newMemSize uint64) (uint64, error) {
 
 还有staticCall调用过程中不允许进行任何修改操作，可以用view来修饰，因此在函数实现中会给解释器的运行函数中的read-only参数传入true值。
 
+## common.go
+存放常用工具方法
+```go
+func calcMemSize64(off, l *uint256.Int) (uint64, bool) 
+func getData(data []byte, start uint64, size uint64) []byte 
+func toWordSize(size uint64) uint64
+func allZero(b []byte) bool
+```
 
+计算内存空间是否溢出、根据给的参数返回数据切片、 返回内存扩展所需的字的大小、判断是否全0
 
+## eips.go
+实现了许多eip协议的配置函数，可以通过函数的方式使能跳转表，使其能够遵循某个eip规则。
 
-
-
-
+## interface.go
+包含stateDB、CallContext两种接口，
 
 
 
