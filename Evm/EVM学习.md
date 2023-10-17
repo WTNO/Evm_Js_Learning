@@ -538,7 +538,9 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 }
 ```
 
-3.1 调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
+3.1 调用`IntrinsicGas()`方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
+
+***
 
 3.2 如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message
 ```go
@@ -671,10 +673,105 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 
 3.2.8 如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。
 
+***
 
+3.3 如果不是新创建的合约，则调用 `st.evm.Call(sender, st.to(), msg.Data, st.gasRemaining, msg.Value)` 方法，同时更新发送方地址nonce值+1.
+```go
+// Call执行与addr关联的合同，并将给定输入作为参数。
+// 它还处理所需的任何价值转移，并采取创建账户和在执行错误或失败的价值转移的情况下反转状态的必要步骤。
+func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
+	// 如果我们试图超过调用深度限制，则失败
+	if evm.depth > int(params.CallCreateDepth) {
+		return nil, gas, ErrDepth
+	}
+	// 如果我们试图转移超过可用余额，则失败
+	if value.Sign() != 0 && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		return nil, gas, ErrInsufficientBalance
+	}
+	snapshot := evm.StateDB.Snapshot()
+	p, isPrecompile := evm.precompile(addr)
+	debug := evm.Config.Tracer != nil
 
+	if !evm.StateDB.Exist(addr) {
+		if !isPrecompile && evm.chainRules.IsEIP158 && value.Sign() == 0 {
+			// 调用一个不存在的账户，不做任何事情，但是ping跟踪器
+			if debug {
+				if evm.depth == 0 {
+					evm.Config.Tracer.CaptureStart(evm, caller.Address(), addr, false, input, gas, value)
+					evm.Config.Tracer.CaptureEnd(ret, 0, nil)
+				} else {
+					evm.Config.Tracer.CaptureEnter(CALL, caller.Address(), addr, input, gas, value)
+					evm.Config.Tracer.CaptureExit(ret, 0, nil)
+				}
+			}
+			return nil, gas, nil
+		}
+		evm.StateDB.CreateAccount(addr)
+	}
+	evm.Context.Transfer(evm.StateDB, caller.Address(), addr, value)
 
+	// 在调试模式下捕获跟踪器开始/结束事件
+	if debug {
+		if evm.depth == 0 {
+			evm.Config.Tracer.CaptureStart(evm, caller.Address(), addr, false, input, gas, value)
+			defer func(startGas uint64) { // 参数的延迟计算
+				evm.Config.Tracer.CaptureEnd(ret, startGas-gas, err)
+			}(gas)
+		} else {
+			// 处理进入和退出调用帧的跟踪器事件
+			evm.Config.Tracer.CaptureEnter(CALL, caller.Address(), addr, input, gas, value)
+			defer func(startGas uint64) {
+				evm.Config.Tracer.CaptureExit(ret, startGas-gas, err)
+			}(gas)
+		}
+	}
 
+	if isPrecompile {
+		ret, gas, err = RunPrecompiledContract(p, input, gas)
+	} else {
+		// 初始化一个新的合同并设置EVM将使用的代码。
+		// 合同是这个执行上下文的范围环境。
+		code := evm.StateDB.GetCode(addr)
+		if len(code) == 0 {
+			ret, err = nil, nil // gas不变
+		} else {
+			addrCopy := addr
+			// 如果账户没有代码，我们可以在这里中止
+			// 深度检查已经完成，预编译处理在上面
+			contract := NewContract(caller, AccountRef(addrCopy), value, gas)
+			contract.SetCallCode(&addrCopy, evm.StateDB.GetCodeHash(addrCopy), code)
+			ret, err = evm.interpreter.Run(contract, input, false)
+			gas = contract.Gas
+		}
+	}
+	// 当EVM返回错误或设置创建代码时
+	// 我们恢复到快照并消耗任何剩余的gas。另外
+	// 当我们在家园时，这也适用于代码存储gas错误。
+	if err != nil {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		if err != ErrExecutionReverted {
+			gas = 0
+		}
+		// TODO: 考虑清理未使用的快照:
+		//} else {
+		//	evm.StateDB.DiscardSnapshot(snapshot)
+	}
+	return ret, gas, err
+}
+```
+evm.call方法和evm.create方法大致相同，我们来说说不一样的地方。
+
+3.3.1 call方法调用的是一个存在的合约地址的合约，所以不用创建合约账户。如果call方法发现本地没有合约接收方的账户，则需要创建一个接收方的账户，并更新本地状态数据库。
+
+3.3.2 create方法的资金transfer转移是在创建合约用户账户和这个合约账户之间发生，而call方法的资金转移是在合约的发送方和合约的接收方之间产生。
+
+3.4 `TransitionDb()` 方法执行完合约，调用 `st.refundGas()` 方法计算合约退税，调用evm SSTORE指令 或者evm SUICIDE指令销毁合约十都会产生退税。
+
+3.5 计算合约产生的gas总数，加入到矿工账户，作为矿工收入。
+
+---
+
+4 回到最开始的ApplyTransaction()方法，根据EVM的执行结果，拼接交易receipt数据，其中receipt.Logs日志数据是EVM执行指令代码的时候产生的，receipt.Bloom根据日志数据建立bloom过滤器。
 
 ## interpreter.go
 ### 数据结构
