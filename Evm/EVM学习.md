@@ -347,9 +347,9 @@ func (evm *EVM) Cancelled() bool {
 2. 第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。
 
 #### 创建EVM，通过EVM执行交易流程
-BlockChain调用processor.Process（）遍历block的所有交易，然后调用：
+BlockChain调用 `processor.Process()` 遍历block的所有交易，然后调用：
 ```go
-receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)
+receipt, err := applyTransaction(msg, p.config, gp, statedb, blockNumber, blockHash, tx, usedGas, vmenv)
 ```
 
 执行交易并返回收据数据
@@ -415,10 +415,10 @@ func applyTransaction(msg *Message, config *params.ChainConfig, gp *GasPool, sta
 ```
 
 1. 首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。
-2. 调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。
-3. 调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。
+2. 调用 `NewEVMBlockContext(header, bc, author)` 创建EVM的上下文环境，调用 `vm.NewEVM(blockContext, vm.TxContext{}, statedb, config, cfg)` 创建EVM对象，并在内部创建一个`evm.interpreter`（虚拟机解析器）。
+3. 调用`ApplyMessage(evm, msg, gp)`方法通过EVM对象来执行Message。
 
-重点看看ApplyMessage()方法的实现：
+重点看看`ApplyMessage()`方法的实现：
 ```go
 // ApplyMessage 通过在环境中应用给定的消息来计算新的状态
 // 对旧的状态进行操作。
@@ -540,9 +540,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 
 3.1 调用`IntrinsicGas()`方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
 
-***
-
-3.2 如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message
+3.2 如果`msg.to == nil`，则是合约创建交易，调用`st.evm.Create(sender, msg.Data, st.gasRemaining, msg.Value)`来执行message
 ```go
 // Create使用代码作为部署代码创建新的合约。
 func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
