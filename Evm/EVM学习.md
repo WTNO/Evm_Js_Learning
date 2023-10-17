@@ -862,12 +862,10 @@ func NewEVMInterpreter(evm *EVM) *EVMInterpreter {
 
 #### Run
 ```go
-// 运行循环并使用给定的输入数据评估合约的代码，返回
-// 返回的字节切片和一个错误（如果有的话）。
-//
-// 重要的是注意，解释器返回的任何错误都应该被
-// 视为撤销并消耗所有燃气的操作，除非是
-// ErrExecutionReverted表示撤销并保留剩余的燃气。
+// 运行循环并使用给定的输入数据评估合约的代码，然后返回返回的字节切片和一个错误（如果出现的话）。
+// 
+// 需要特别注意的是，解释器返回的任何错误都应被视为一个恢复并消耗所有气体的操作，
+// 除了ErrExecutionReverted，这意味着恢复并保留剩余的气体。
 func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
 	// 增加调用深度，限制为1024
 	in.evm.depth++
@@ -935,7 +933,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			logged, pcCopy, gasCopy = false, pc, contract.Gas
 		}
 		// 从跳转表中获取操作，并验证栈以确保有足够的栈项可用来执行操作。
+		// 第一步：根据pc获取一条指令
 		op = contract.GetOp(pc)
+		// 第二步：根据指令从JumpTable中获得操作码
 		operation := in.table[op]
 		cost = operation.constantGas // 用于跟踪
 		// 验证栈
@@ -950,18 +950,22 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		if operation.dynamicGas != nil {
 			// 所有具有动态内存使用的操作也具有动态燃气成本。
 			var memorySize uint64
+			// 第四步：计算指令需要的内存大小
 			// 计算新的内存大小并扩展内存以适应操作
 			// 内存检查需要在评估动态燃气部分之前完成，以检测计算溢出
 			if operation.memorySize != nil {
+				// 先判断内存大小是否足够
 				memSize, overflow := operation.memorySize(stack)
 				if overflow {
 					return nil, ErrGasUintOverflow
 				}
-				// 内存以32字节的字扩展。燃气也以字计算。
+				// 如果足够则以32 bytes为单位进行内存扩充，并计算gas
+				// 内存以32字节的字扩展。燃气也以word计算。
 				if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
 					return nil, ErrGasUintOverflow
 				}
 			}
+			// 第五步：获取指令所需要的gas，然后从交易余额中扣除，如果余额不足，直接返回
 			// 消耗燃气并在没有足够的燃气可用时返回错误。
 			// cost被显式设置，以便capture state 延迟方法可以得到适当的成本
 			var dynamicCost uint64
@@ -975,6 +979,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 				in.evm.Config.Tracer.CaptureState(pc, op, gasCopy, cost, callContext, in.returnData, in.evm.depth, err)
 				logged = true
 			}
+			// 第六步：重新调整刚才获得的SafeSize的内存大小
 			if memorySize > 0 {
 				mem.Resize(memorySize)
 			}
@@ -982,6 +987,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			in.evm.Config.Tracer.CaptureState(pc, op, gasCopy, cost, callContext, in.returnData, in.evm.depth, err)
 			logged = true
 		}
+		// 第七步：重要！！！！执行指令！！！！！
 		// 执行操作
 		res, err = operation.execute(&pc, in, callContext)
 		if err != nil {
@@ -999,7 +1005,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 ```
 
 我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。
-1. 首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。
+1. 首先调用`contract.GetOp(pc)`从合约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。
 2. 从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是
 	```go
 	SHA3: {
@@ -1021,6 +1027,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 7. operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。
 8. operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。
 
+总体来说，解释器执行循环的过程如下图：
+
+![image](./img/20181210155005301.png)
 
 ## jump_table.go
 ### 数据结构
