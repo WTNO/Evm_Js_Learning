@@ -620,10 +620,8 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		err = ErrInvalidCode
 	}
 
-	// 如果合约创建成功运行且没有返回错误
-	// 计算存储代码所需的gas。如果代码不能
-	// 由于gas不足而存储，设置一个错误并让它被
-	// 下面的错误检查条件处理。
+	// 如果合同创建成功运行且没有返回错误，则计算存储代码所需的气体。
+	// 如果由于气体不足而无法存储代码，则设置一个错误，并让其由下面的错误检查条件处理。
 	if err == nil {
 		createDataGas := uint64(len(ret)) * params.CreateDataGas
 		if contract.UseGas(createDataGas) {
@@ -633,9 +631,8 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		}
 	}
 
-	// 当EVM返回错误，或者当设置创建代码
-	// 上面我们回滚到快照并消耗任何剩余的gas。此外
-	// 当我们在homestead这也计算代码存储gas错误。
+	// 当EVM返回错误或在设置创建代码时，我们将恢复到快照并消耗剩余的任何气体。
+	// 此外，当我们在家园时，这也适用于代码存储气体错误。
 	if err != nil && (evm.chainRules.IsHomestead || err != ErrCodeStoreOutOfGas) {
 		evm.StateDB.RevertToSnapshot(snapshot)
 		if err != ErrExecutionReverted {
@@ -670,8 +667,6 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 3.2.7 run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。
 
 3.2.8 如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。
-
-***
 
 3.3 如果不是新创建的合约，则调用 `st.evm.Call(sender, st.to(), msg.Data, st.gasRemaining, msg.Value)` 方法，同时更新发送方地址nonce值+1.
 ```go
